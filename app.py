@@ -73,14 +73,23 @@ def mistral_embed(texts):
     if isinstance(texts, str):
         texts = [texts]
     out = []
-    for i in range(0, len(texts), 32):
-        batch = texts[i:i + 32]
-        r = requests.post(
-            "https://api.mistral.ai/v1/embeddings",
-            headers={"Authorization": f"Bearer {MISTRAL_KEY}"},
-            json={"model": EMBED_MODEL, "input": batch}, timeout=120)
-        r.raise_for_status()
-        out.extend([d["embedding"] for d in r.json()["data"]])
+    for i in range(0, len(texts), 16):          # smaller batches
+        batch = texts[i:i + 16]
+        for attempt in range(6):                # retry on 429/5xx
+            r = requests.post(
+                "https://api.mistral.ai/v1/embeddings",
+                headers={"Authorization": f"Bearer {MISTRAL_KEY}"},
+                json={"model": EMBED_MODEL, "input": batch}, timeout=120)
+            if r.status_code == 429 or r.status_code >= 500:
+                wait = float(r.headers.get("Retry-After", 2 ** attempt))
+                time.sleep(min(wait, 30))
+                continue
+            r.raise_for_status()
+            out.extend([d["embedding"] for d in r.json()["data"]])
+            break
+        else:
+            raise RuntimeError("Mistral embeddings rate-limited after retries")
+        time.sleep(0.5)                          # gentle pacing between batches
     return out
 
 def mistral_chat(system, user, temperature=0.1):
