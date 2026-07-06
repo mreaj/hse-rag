@@ -8,13 +8,10 @@ Stack (all free / cheap, no GPU, no Azure approvals):
   • Qdrant Cloud                → shared, persistent vector store
   • Mistral API (open models)   → embeddings (mistral-embed) + chat (open-mistral / open-mixtral)
   • Microsoft Graph (app-only)  → read the public SharePoint library (Sites.Selected)
-
-Two tabs:
-  • Chat  — public, no login. Anyone with the URL asks questions.
-  • Admin — password-gated. Sync the SharePoint library into the shared index.
 """
 import os, io, re, json, time, uuid, hashlib
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse, unquote
 
 import requests
 import streamlit as st
@@ -31,18 +28,32 @@ def cfg(key, default=None):
         return st.secrets[key]
     return os.getenv(key, default)
 
+def normalize_qdrant_url(u):
+    """Ensure https:// scheme and the REST port :6333 (Qdrant Cloud); strip any path.
+    Makes a URL pasted without the port work anyway (the common 404 cause)."""
+    u = (u or "").strip().rstrip("/")
+    if not u:
+        return u
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    p = urlparse(u)
+    netloc = p.netloc
+    if ":" not in netloc:            # no port specified -> add REST port
+        netloc = netloc + ":6333"
+    return urlunparse((p.scheme, netloc, "", "", "", ""))
+
 MISTRAL_KEY   = cfg("MISTRAL_API_KEY", "")
-QDRANT_URL    = cfg("QDRANT_URL", "")
+QDRANT_URL    = normalize_qdrant_url(cfg("QDRANT_URL", ""))
 QDRANT_KEY    = cfg("QDRANT_API_KEY", "")
 ADMIN_PW      = cfg("ADMIN_PASSWORD", "")
 
 TENANT_ID     = cfg("TENANT_ID", "")
 CLIENT_ID     = cfg("CLIENT_ID", "")
 CLIENT_SECRET = cfg("CLIENT_SECRET", "")
-SITE_URL      = cfg("SITE_URL", "")          # https://tenant.sharepoint.com/sites/HSE[/Library/Folder]
+SITE_URL      = cfg("SITE_URL", "")
 
-CHAT_MODEL    = cfg("CHAT_MODEL", "open-mistral-7b")   # open-mixtral-8x7b for stronger answers
-EMBED_MODEL   = "mistral-embed"                          # 1024-dim
+CHAT_MODEL    = cfg("CHAT_MODEL", "open-mistral-7b")
+EMBED_MODEL   = "mistral-embed"        # 1024-dim
 COLLECTION    = "hse_docs"
 TOP_K         = int(cfg("TOP_K", 6))
 CHUNK_SIZE    = 1000
@@ -59,7 +70,6 @@ SUGGESTED = [
 
 # ─────────────────────────────────────────────────────────── Mistral helpers
 def mistral_embed(texts):
-    """Return list[list[float]] for a list of strings (batched)."""
     if isinstance(texts, str):
         texts = [texts]
     out = []
@@ -86,7 +96,8 @@ def mistral_chat(system, user, temperature=0.1):
 # ─────────────────────────────────────────────────────────── Qdrant
 @st.cache_resource(show_spinner=False)
 def qdrant():
-    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_KEY, timeout=60)
+    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_KEY,
+                        timeout=60, check_compatibility=False)
 
 def ensure_collection():
     c = qdrant()
@@ -108,7 +119,8 @@ def graph_app_token():
         data={"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
               "grant_type": "client_credentials",
               "scope": "https://graph.microsoft.com/.default"}, timeout=30)
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"Graph token failed: {r.status_code} {r.text[:200]}")
     return r.json()["access_token"]
 
 def gget(url, token):
@@ -123,11 +135,30 @@ def gget(url, token):
 def parse_site_url(url):
     m = re.match(r"https?://([^/]+)((?:/sites/[^/?#]+)?)", url, re.I)
     host, site = (m.group(1), m.group(2) or "/") if m else (None, None)
-    from urllib.parse import urlparse, unquote
     path = unquote(urlparse(url).path)
     path = re.sub(r"/Forms/[^/]*$", "", path)
     path = re.sub(r"/[^/]+\.aspx$", "", path).rstrip("/")
     return host, site, path
+
+def resolve_drive(site_path, folder_path, drives, default_drive, log):
+    """Return (drive, subfolder_rel_path). Handles library-as-drive and folder-in-default-library."""
+    rest = folder_path[len(site_path):].strip("/") if folder_path.startswith(site_path) else ""
+    segments = [s for s in rest.split("/") if s]
+    # 1) library whose NAME matches the first path segment (e.g. "HSEN Legacy" is its own library)
+    if segments:
+        for d in drives:
+            if d.get("name", "").lower() == segments[0].lower():
+                log(f"matched library by name: {d.get('name')}")
+                return d, "/".join(segments[1:])
+    # 2) library whose webUrl is a prefix of the folder path
+    for d in drives:
+        dp = unquote(urlparse(d.get("webUrl", "")).path).rstrip("/")
+        if dp and folder_path.startswith(dp):
+            log(f"matched library by url: {d.get('name')}")
+            return d, folder_path[len(dp):].strip("/")
+    # 3) fall back to the default document library, treat the whole rest as a subfolder
+    log(f"no library match; using default library '{default_drive.get('name')}' + subfolder '{rest}'")
+    return default_drive, rest
 
 def iter_files(site_id, drive_id, token, folder="root"):
     stack = [folder]
@@ -183,25 +214,33 @@ def sync_library(log):
     ensure_collection()
     token = graph_app_token()
     host, site, folder_path = parse_site_url(SITE_URL)
+    if not host:
+        raise RuntimeError(f"Could not parse SITE_URL: {SITE_URL}")
+
     site_resp = gget(f"{GRAPH}/sites/{host}:{site}", token).json()
+    if "error" in site_resp:
+        raise RuntimeError(f"Site access failed ({site}): "
+                           f"{site_resp['error'].get('message', site_resp['error'])}. "
+                           "If this is 403/accessDenied, the app isn't granted on this site "
+                           "(Sites.Selected needs a one-time per-site grant).")
     site_id = site_resp["id"]
+
     drives = gget(f"{GRAPH}/sites/{site_id}/drives", token).json().get("value", [])
-    # pick the drive matching the folder path, else the default
-    target, subfolder = None, ""
-    for d in drives:
-        from urllib.parse import urlparse, unquote
-        dp = unquote(urlparse(d.get("webUrl", "")).path).rstrip("/")
-        if folder_path.startswith(dp):
-            target = d; subfolder = folder_path[len(dp):].lstrip("/"); break
-    if not target:
-        target = drives[0]
-    drive_id = target["id"]
+    if not drives:
+        raise RuntimeError("No document libraries found (or no access to them).")
+    default_drive = gget(f"{GRAPH}/sites/{site_id}/drive", token).json()
+    log("Libraries visible: " + ", ".join(d.get("name", "?") for d in drives))
+
+    drive, subfolder = resolve_drive(site, folder_path, drives, default_drive, log)
+    drive_id = drive["id"]
 
     start_folder = "root"
     if subfolder:
         r = gget(f"{GRAPH}/sites/{site_id}/drives/{drive_id}/root:/{subfolder}", token)
         if r.status_code == 200:
             start_folder = r.json()["id"]
+        else:
+            log(f"subfolder '{subfolder}' not found in '{drive.get('name')}' — crawling library root")
 
     scanned = indexed = chunks_total = 0
     for it in iter_files(site_id, drive_id, token, start_folder):
@@ -286,7 +325,10 @@ with tab_chat:
             st.markdown(q)
         with st.chat_message("assistant"):
             with st.spinner("Searching documents…"):
-                text, refs = answer(q)
+                try:
+                    text, refs = answer(q)
+                except Exception as e:
+                    text, refs = f"Error: {e}", []
             if refs:
                 text += "\n\n**Sources**\n" + "\n".join(
                     f"- [{r['name']}]({r['web_url']})" if r["web_url"] else f"- {r['name']}"
@@ -302,6 +344,17 @@ with tab_admin:
             st.rerun()
         st.stop()
 
+    st.subheader("Diagnostics")
+    st.write("**Qdrant URL in use:**", f"`{QDRANT_URL}`")
+    if st.button("🧪 Test Qdrant connection"):
+        try:
+            cols = [c.name for c in qdrant().get_collections().collections]
+            st.success(f"Qdrant OK. Collections: {cols or '(none yet)'}")
+        except Exception as e:
+            st.error(f"Qdrant failed: {e}")
+
+    st.divider()
+    st.subheader("Sync")
     st.write(f"**Site:** {SITE_URL or '(SITE_URL not set)'}")
     st.write(f"**Index:** {index_count()} chunks")
     if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET and SITE_URL):
@@ -315,6 +368,7 @@ with tab_admin:
                     sync_library(log)
                 except Exception as e:
                     log(f"ERROR: {e}")
+
     st.divider()
     if st.button("🗑️ Clear entire index"):
         try:
