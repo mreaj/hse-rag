@@ -1,12 +1,13 @@
 """
-HSE Assistant — shared team app (rich UI + branding)
+HSE Assistant — shared team app (rich UI + branding + memory-safe batch sync)
 ────────────────────────────────────────────────────────────────────────────
 Public docs → one shared index → give the URL to your team, they just ask.
 
-Branding (logo, company name, accent colour) is uploaded in the Admin tab and
-stored in Qdrant, so it persists and shows for everyone. Chunking is incremental.
+Bulk loading 1900+ docs: prefer running ingest.py (locally or via GitHub Actions).
+The in-app Sync here is MEMORY-SAFE: it indexes a small slice per click and stops,
+so it never exhausts Streamlit Cloud's ~1 GB container. Chunking is incremental.
 """
-import os, io, re, json, time, uuid, base64, hashlib
+import os, io, re, json, time, uuid, base64
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
 
@@ -270,10 +271,8 @@ def chunk(text):
 def point_id(item_id, ordinal):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{item_id}:{ordinal}"))
 
-# ─────────────────────────────────────────────────────────── ingestion
-def sync_library(progress, log, force=False):
-    ensure_collection()
-    token = graph_app_token()
+# ─────────────────────────────────────────────────────────── ingestion (batch/slice)
+def _resolve_target(token, log):
     host, site, folder_path = parse_site_url(SITE_URL)
     if not host:
         raise RuntimeError(f"Could not parse SITE_URL: {SITE_URL}")
@@ -297,40 +296,61 @@ def sync_library(progress, log, force=False):
             start_folder = r.json()["id"]
         else:
             log(f"subfolder '{subfolder}' not found — crawling library root")
+    return site_id, drive_id, start_folder
+
+def index_one(drive_id, it, token, log):
+    text = extract_text(it["name"], download(drive_id, it["id"], token))
+    pieces = chunk(text)
+    if not pieces:
+        log(f"skip (no text): {it['name']}")
+        return 0
+    vecs = mistral_embed(pieces)
+    pts = [PointStruct(id=point_id(it["id"], j), vector=v,
+                       payload={"item_id": it["id"], "name": it["name"],
+                                "web_url": it.get("webUrl", ""), "text": ch})
+           for j, (ch, v) in enumerate(zip(pieces, vecs))]
+    qdrant().upsert(COLLECTION, points=pts)
+    log(f"indexed: {it['name']} ({len(pts)} chunks)")
+    return len(pts)
+
+def sync_batch(limit, progress, log, force=False):
+    """Index up to `limit` not-yet-indexed files, then STOP (keeps memory low).
+    Returns how many files still remain, so you know whether to click again."""
+    ensure_collection()
+    token = graph_app_token()
+    site_id, drive_id, start_folder = _resolve_target(token, log)
+
     log("Listing files…")
     files = [it for it in iter_files(site_id, drive_id, token, start_folder)
              if Path(it["name"]).suffix.lower() in SUPPORTED]
     total = len(files)
     log(f"{total} supported files found.")
-    indexed = skipped = notext = failed = chunks_total = 0
-    for n, it in enumerate(files, 1):
+
+    indexed = skipped = notext = failed = chunks_total = remaining = 0
+    for it in files:
+        if not force and already_indexed(it["id"]):
+            skipped += 1
+            continue
+        if indexed >= limit:              # this batch is full — count the rest and stop
+            remaining += 1
+            continue
         try:
-            if not force and already_indexed(it["id"]):
-                skipped += 1
+            c = index_one(drive_id, it, token, log)
+            if c:
+                indexed += 1; chunks_total += c
             else:
-                text = extract_text(it["name"], download(drive_id, it["id"], token))
-                pieces = chunk(text)
-                if not pieces:
-                    notext += 1; log(f"skip (no text): {it['name']}")
-                else:
-                    vecs = mistral_embed(pieces)
-                    pts = [PointStruct(id=point_id(it["id"], j), vector=v,
-                                       payload={"item_id": it["id"], "name": it["name"],
-                                                "web_url": it.get("webUrl", ""), "text": ch})
-                           for j, (ch, v) in enumerate(zip(pieces, vecs))]
-                    qdrant().upsert(COLLECTION, points=pts)
-                    indexed += 1; chunks_total += len(pts)
-                    log(f"indexed: {it['name']} ({len(pts)} chunks)")
+                notext += 1
         except Exception as e:
             failed += 1; log(f"FAILED {it['name']}: {e}")
-        progress(n, total, indexed, skipped, notext, failed, chunks_total)
-    log(f"Done. {indexed} indexed · {skipped} already · {notext} no-text · "
-        f"{failed} failed · {chunks_total} new chunks.")
+        progress(indexed, limit, skipped, notext, failed, chunks_total)
+    log(f"Batch done. {indexed} indexed · {skipped} already · {notext} no-text · "
+        f"{failed} failed · {chunks_total} chunks. ~{remaining} files remaining.")
+    return remaining
 
 # ─────────────────────────────────────────────────────────── RAG
 def answer(question):
     if any(k in question.lower() for k in ("how many document", "number of document")):
-        return f"There are **{index_count()} chunks** indexed in the knowledge base.", []
+        return f"There are **{index_count():,} chunks** indexed in the knowledge base.", []
     qv = mistral_embed(question)[0]
     hits = qdrant().query_points(COLLECTION, query=qv, limit=TOP_K, with_payload=True).points
     if not hits:
@@ -359,7 +379,6 @@ st.markdown(f"""
 html, body, [class*="css"] {{ font-family:'Inter',sans-serif; }}
 #MainMenu, footer {{ visibility:hidden; }}
 .block-container {{ padding-top:1.4rem; max-width:1100px; }}
-
 .app-header {{
   display:flex; align-items:center; gap:16px; padding:16px 20px; margin-bottom:6px;
   background:linear-gradient(135deg, color-mix(in srgb, var(--accent) 14%, transparent), transparent);
@@ -373,25 +392,17 @@ html, body, [class*="css"] {{ font-family:'Inter',sans-serif; }}
 .app-badge {{ margin-left:auto; font-size:12px; font-weight:600; padding:6px 12px; border-radius:20px;
   background:color-mix(in srgb, var(--accent) 16%, transparent);
   color:var(--accent); border:1px solid color-mix(in srgb, var(--accent) 30%, transparent); white-space:nowrap; }}
-
 div[data-testid="stChatMessage"] {{ border-radius:14px; padding:4px 6px; }}
-
-.stButton>button {{
-  border-radius:12px; border:1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-  font-weight:600; transition:all .15s ease;
-}}
+.stButton>button {{ border-radius:12px; border:1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  font-weight:600; transition:all .15s ease; }}
 .stButton>button:hover {{ border-color:var(--accent); color:var(--accent); transform:translateY(-1px); }}
-
 .suggest-label {{ font-size:12px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
   opacity:.55; margin:6px 0 4px; }}
-
 .stTabs [data-baseweb="tab-list"] {{ gap:4px; }}
 .stTabs [data-baseweb="tab"] {{ border-radius:10px 10px 0 0; font-weight:600; }}
-.admin-card {{ border:1px solid rgba(128,128,128,.2); border-radius:14px; padding:16px 18px; margin-bottom:12px; }}
 </style>
 """, unsafe_allow_html=True)
 
-# ── header ──
 src = logo_src(brand)
 logo_html = (f'<img class="app-logo" src="{src}"/>' if src
              else '<div class="app-logo-fallback">🦺</div>')
@@ -419,7 +430,7 @@ tab_chat, tab_admin = st.tabs(["💬  Ask", "⚙️  Admin"])
 with tab_chat:
     st.session_state.setdefault("messages", [])
     if n_chunks == 0:
-        st.info("The knowledge base is empty. An admin needs to run **Sync** in the Admin tab first.")
+        st.info("The knowledge base is empty. An admin needs to run **Sync** (or ingest.py) first.")
 
     for m in st.session_state.messages:
         with st.chat_message(m["role"], avatar=("🧑" if m["role"] == "user" else "🦺")):
@@ -464,37 +475,35 @@ with tab_admin:
 
     # Branding
     st.markdown("#### 🎨 Branding")
-    with st.container():
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            if src:
-                st.image(src, width=120)
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if src:
+            st.image(src, width=120)
+        else:
+            st.caption("No logo yet")
+    with c2:
+        up = st.file_uploader("Upload company logo (PNG/JPG/SVG, keep it small)",
+                              type=["png", "jpg", "jpeg", "svg"])
+        title = st.text_input("App / company name", value=brand.get("title", "HSE Assistant"))
+        subtitle = st.text_input("Subtitle", value=brand.get("subtitle", ""))
+        accent = st.color_picker("Accent colour", value=brand.get("accent", "#0F9D8C"))
+    b1, b2 = st.columns(2)
+    if b1.button("💾 Save branding", use_container_width=True):
+        new = dict(brand); new.update({"title": title, "subtitle": subtitle, "accent": accent})
+        if up is not None:
+            data = up.read()
+            if len(data) > 1_500_000:
+                st.warning("Logo is large (>1.5 MB). Please upload a smaller image.")
             else:
-                st.caption("No logo yet")
-        with c2:
-            up = st.file_uploader("Upload company logo (PNG/JPG/SVG, keep it small)",
-                                  type=["png", "jpg", "jpeg", "svg"])
-            title = st.text_input("App / company name", value=brand.get("title", "HSE Assistant"))
-            subtitle = st.text_input("Subtitle", value=brand.get("subtitle", ""))
-            accent = st.color_picker("Accent colour", value=brand.get("accent", "#0F9D8C"))
-        b1, b2 = st.columns(2)
-        if b1.button("💾 Save branding", use_container_width=True):
-            new = dict(brand)
-            new.update({"title": title, "subtitle": subtitle, "accent": accent})
-            if up is not None:
-                data = up.read()
-                if len(data) > 1_500_000:
-                    st.warning("Logo is large (>1.5 MB). Please upload a smaller image.")
-                else:
-                    new["logo_b64"] = base64.b64encode(data).decode()
-                    new["logo_mime"] = up.type or "image/png"
-            try:
-                save_brand(new); st.success("Saved. Refresh to see the new branding.")
-            except Exception as e:
-                st.error(f"Could not save: {e}")
-        if b2.button("Remove logo", use_container_width=True):
-            new = dict(brand); new["logo_b64"] = ""; new["logo_mime"] = ""; new["logo_url"] = ""
-            save_brand(new); st.success("Logo removed. Refresh to update.")
+                new["logo_b64"] = base64.b64encode(data).decode()
+                new["logo_mime"] = up.type or "image/png"
+        try:
+            save_brand(new); st.success("Saved. Refresh to see the new branding.")
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+    if b2.button("Remove logo", use_container_width=True):
+        new = dict(brand); new["logo_b64"] = ""; new["logo_mime"] = ""; new["logo_url"] = ""
+        save_brand(new); st.success("Logo removed. Refresh to update.")
 
     st.divider()
     # Diagnostics
@@ -508,35 +517,42 @@ with tab_admin:
             st.error(f"Qdrant failed: {e}")
 
     st.divider()
-    # Sync
-    st.markdown("#### 🔄 Sync documents")
+    # Sync (memory-safe, slice per click)
+    st.markdown("#### 🔄 Sync documents (memory-safe)")
+    st.caption("For the full 1900-doc load, run **ingest.py** (locally or via GitHub Actions). "
+               "In-app Sync indexes a small slice per click so it never runs out of memory.")
     st.write(f"**Site:** {SITE_URL or '(SITE_URL not set)'}")
     st.write(f"**Index:** {index_count():,} chunks")
+    batch_n = st.number_input("Files to index per click", 20, 300, 100, step=20)
     force = st.checkbox("Force re-index (re-chunk even already-indexed files)")
     if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET and SITE_URL):
         st.warning("Set TENANT_ID, CLIENT_ID, CLIENT_SECRET and SITE_URL in Secrets to enable Sync.")
     else:
-        if st.button("🔄 Sync SharePoint library → index", use_container_width=True):
+        if st.button("🔄 Index next batch", use_container_width=True):
             bar = st.progress(0.0); status = st.empty(); logbox = st.empty(); buf = []
             def log(m):
                 buf.append(str(m)); logbox.code("\n".join(buf[-25:]))
-            def progress(done, total, indexed, skipped, notext, failed, chunks):
-                bar.progress(done / total if total else 1.0)
-                status.markdown(f"**{done}/{total}** files · {indexed} indexed · {skipped} already · "
-                                f"{notext} no-text · {failed} failed · {chunks} new chunks")
+            def progress(indexed, limit, skipped, notext, failed, chunks):
+                bar.progress(min(indexed / limit, 1.0) if limit else 1.0)
+                status.markdown(f"**{indexed}/{limit}** indexed this batch · {skipped} already · "
+                                f"{notext} no-text · {failed} failed · {chunks} chunks")
             try:
-                sync_library(progress, log, force=force); st.success("Sync finished.")
+                remaining = sync_batch(int(batch_n), progress, log, force=force)
+                if remaining == 0:
+                    st.success("All documents indexed. 🎉")
+                else:
+                    st.info(f"Batch done. ~{remaining} files still to index — click **Index next batch** again.")
             except Exception as e:
                 log(f"ERROR: {e}")
 
     st.divider()
     # Danger zone
     st.markdown("#### 🗑️ Danger zone")
-    st.caption("Clear removes ALL vectors so the next Sync re-chunks every document from scratch.")
+    st.caption("Clear removes ALL vectors so the next Sync/ingest re-chunks every document.")
     confirm = st.checkbox("I understand — wipe the whole index")
     if st.button("Clear entire index", disabled=not confirm):
         try:
             qdrant().delete_collection(COLLECTION); ensure_collection()
-            st.success("Index cleared. Run Sync to rebuild.")
+            st.success("Index cleared. Run Sync or ingest.py to rebuild.")
         except Exception as e:
             st.error(str(e))
