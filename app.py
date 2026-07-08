@@ -3,11 +3,9 @@ HSE Assistant — shared team app
 ────────────────────────────────────────────────────────────────────────────
 Public docs → one shared index → give the URL to your team, they just ask.
 
-Stack (all free / cheap, no GPU, no Azure approvals):
-  • Streamlit Community Cloud   → hosting + public URL
-  • Qdrant Cloud                → shared, persistent vector store
-  • Mistral API (open models)   → embeddings (mistral-embed) + chat (open-mistral / open-mixtral)
-  • Microsoft Graph (app-only)  → read the public SharePoint library (Sites.Selected)
+Chunking is incremental: a document is only chunked/embedded if it isn't already
+in the index (checked by SharePoint item id). Use "Clear index" for a fresh rebuild,
+or the "Force re-index" checkbox to re-chunk everything.
 """
 import os, io, re, json, time, uuid, hashlib
 from pathlib import Path
@@ -15,10 +13,11 @@ from urllib.parse import urlparse, urlunparse, unquote
 
 import requests
 import streamlit as st
-from pypdf import PdfReader
+import pdfplumber
 import docx as _docx
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (Distance, VectorParams, PointStruct,
+                                  Filter, FieldCondition, MatchValue)
 
 st.set_page_config(page_title="HSE Assistant", page_icon="🦺", layout="wide")
 
@@ -29,8 +28,6 @@ def cfg(key, default=None):
     return os.getenv(key, default)
 
 def normalize_qdrant_url(u):
-    """Ensure https:// scheme and the REST port :6333 (Qdrant Cloud); strip any path.
-    Makes a URL pasted without the port work anyway (the common 404 cause)."""
     u = (u or "").strip().rstrip("/")
     if not u:
         return u
@@ -38,7 +35,7 @@ def normalize_qdrant_url(u):
         u = "https://" + u
     p = urlparse(u)
     netloc = p.netloc
-    if ":" not in netloc:            # no port specified -> add REST port
+    if ":" not in netloc:
         netloc = netloc + ":6333"
     return urlunparse((p.scheme, netloc, "", "", "", ""))
 
@@ -58,6 +55,7 @@ COLLECTION    = "hse_docs"
 TOP_K         = int(cfg("TOP_K", 6))
 CHUNK_SIZE    = 1000
 CHUNK_OVERLAP = 200
+EMBED_BATCH   = 16
 SUPPORTED     = {".pdf", ".docx", ".txt", ".md"}
 GRAPH         = "https://graph.microsoft.com/v1.0"
 
@@ -70,12 +68,13 @@ SUGGESTED = [
 
 # ─────────────────────────────────────────────────────────── Mistral helpers
 def mistral_embed(texts):
+    """Embed a list of strings. Retries on 429 / 5xx with backoff + pacing."""
     if isinstance(texts, str):
         texts = [texts]
     out = []
-    for i in range(0, len(texts), 16):          # smaller batches
-        batch = texts[i:i + 16]
-        for attempt in range(6):                # retry on 429/5xx
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i:i + EMBED_BATCH]
+        for attempt in range(6):
             r = requests.post(
                 "https://api.mistral.ai/v1/embeddings",
                 headers={"Authorization": f"Bearer {MISTRAL_KEY}"},
@@ -89,7 +88,7 @@ def mistral_embed(texts):
             break
         else:
             raise RuntimeError("Mistral embeddings rate-limited after retries")
-        time.sleep(0.5)                          # gentle pacing between batches
+        time.sleep(0.3)
     return out
 
 def mistral_chat(system, user, temperature=0.1):
@@ -121,6 +120,15 @@ def index_count():
     except Exception:
         return 0
 
+def already_indexed(item_id):
+    """True if this SharePoint item already has vectors — so we DON'T re-chunk it."""
+    try:
+        c = qdrant().count(COLLECTION, exact=False, count_filter=Filter(
+            must=[FieldCondition(key="item_id", match=MatchValue(value=item_id))])).count
+        return c > 0
+    except Exception:
+        return False
+
 # ─────────────────────────────────────────────────────────── SharePoint (app-only, read-only)
 def graph_app_token():
     r = requests.post(
@@ -150,23 +158,19 @@ def parse_site_url(url):
     return host, site, path
 
 def resolve_drive(site_path, folder_path, drives, default_drive, log):
-    """Return (drive, subfolder_rel_path). Handles library-as-drive and folder-in-default-library."""
     rest = folder_path[len(site_path):].strip("/") if folder_path.startswith(site_path) else ""
     segments = [s for s in rest.split("/") if s]
-    # 1) library whose NAME matches the first path segment (e.g. "HSEN Legacy" is its own library)
     if segments:
         for d in drives:
             if d.get("name", "").lower() == segments[0].lower():
                 log(f"matched library by name: {d.get('name')}")
                 return d, "/".join(segments[1:])
-    # 2) library whose webUrl is a prefix of the folder path
     for d in drives:
         dp = unquote(urlparse(d.get("webUrl", "")).path).rstrip("/")
         if dp and folder_path.startswith(dp):
             log(f"matched library by url: {d.get('name')}")
             return d, folder_path[len(dp):].strip("/")
-    # 3) fall back to the default document library, treat the whole rest as a subfolder
-    log(f"no library match; using default library '{default_drive.get('name')}' + subfolder '{rest}'")
+    log(f"no library match; using default '{default_drive.get('name')}' + subfolder '{rest}'")
     return default_drive, rest
 
 def iter_files(site_id, drive_id, token, folder="root"):
@@ -191,14 +195,34 @@ def download(drive_id, item_id, token):
 
 # ─────────────────────────────────────────────────────────── parsing + chunking
 def extract_text(name, data):
+    """pdfplumber for PDFs (text + tables) — recovers far more than pypdf on HSE notices."""
     ext = Path(name).suffix.lower()
     try:
         if ext == ".pdf":
-            reader = PdfReader(io.BytesIO(data))
-            return "\n".join((p.extract_text() or "") for p in reader.pages)
+            parts = []
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        parts.append(t.strip())
+                    try:
+                        for tbl in page.extract_tables():
+                            rows = [" | ".join((c or "").strip() for c in row) for row in tbl]
+                            rows = [r for r in rows if r.strip(" |")]
+                            if rows:
+                                parts.append("[TABLE]\n" + "\n".join(rows))
+                    except Exception:
+                        pass
+            return "\n\n".join(parts)
         if ext == ".docx":
             d = _docx.Document(io.BytesIO(data))
-            return "\n".join(p.text for p in d.paragraphs)
+            paras = [p.text for p in d.paragraphs if p.text.strip()]
+            for tbl in d.tables:
+                for row in tbl.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    if any(cells):
+                        paras.append(" | ".join(cells))
+            return "\n".join(paras)
         if ext in (".txt", ".md"):
             return data.decode("utf-8", errors="ignore")
     except Exception as e:
@@ -219,7 +243,7 @@ def point_id(item_id, ordinal):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{item_id}:{ordinal}"))
 
 # ─────────────────────────────────────────────────────────── ingestion
-def sync_library(log):
+def sync_library(progress, log, force=False):
     ensure_collection()
     token = graph_app_token()
     host, site, folder_path = parse_site_url(SITE_URL)
@@ -230,13 +254,13 @@ def sync_library(log):
     if "error" in site_resp:
         raise RuntimeError(f"Site access failed ({site}): "
                            f"{site_resp['error'].get('message', site_resp['error'])}. "
-                           "If this is 403/accessDenied, the app isn't granted on this site "
+                           "If 403/accessDenied, the app isn't granted on this site "
                            "(Sites.Selected needs a one-time per-site grant).")
     site_id = site_resp["id"]
 
     drives = gget(f"{GRAPH}/sites/{site_id}/drives", token).json().get("value", [])
     if not drives:
-        raise RuntimeError("No document libraries found (or no access to them).")
+        raise RuntimeError("No document libraries found (or no access).")
     default_drive = gget(f"{GRAPH}/sites/{site_id}/drive", token).json()
     log("Libraries visible: " + ", ".join(d.get("name", "?") for d in drives))
 
@@ -249,29 +273,41 @@ def sync_library(log):
         if r.status_code == 200:
             start_folder = r.json()["id"]
         else:
-            log(f"subfolder '{subfolder}' not found in '{drive.get('name')}' — crawling library root")
+            log(f"subfolder '{subfolder}' not found — crawling library root")
 
-    scanned = indexed = chunks_total = 0
-    for it in iter_files(site_id, drive_id, token, start_folder):
-        scanned += 1
-        if Path(it["name"]).suffix.lower() not in SUPPORTED:
-            continue
+    log("Listing files…")
+    files = [it for it in iter_files(site_id, drive_id, token, start_folder)
+             if Path(it["name"]).suffix.lower() in SUPPORTED]
+    total = len(files)
+    log(f"{total} supported files found.")
+
+    indexed = skipped = notext = failed = chunks_total = 0
+    for n, it in enumerate(files, 1):
         try:
-            text = extract_text(it["name"], download(drive_id, it["id"], token))
-            pieces = chunk(text)
-            if not pieces:
-                log(f"skip (no text): {it['name']}"); continue
-            vecs = mistral_embed(pieces)
-            pts = [PointStruct(id=point_id(it["id"], j), vector=v,
-                               payload={"item_id": it["id"], "name": it["name"],
-                                        "web_url": it.get("webUrl", ""), "text": ch})
-                   for j, (ch, v) in enumerate(zip(pieces, vecs))]
-            qdrant().upsert(COLLECTION, points=pts)
-            indexed += 1; chunks_total += len(pts)
-            log(f"indexed: {it['name']} ({len(pts)} chunks)")
+            # ── chunk ONLY if this document isn't already in the index ──
+            if not force and already_indexed(it["id"]):
+                skipped += 1
+            else:
+                text = extract_text(it["name"], download(drive_id, it["id"], token))
+                pieces = chunk(text)
+                if not pieces:
+                    notext += 1
+                    log(f"skip (no text): {it['name']}")
+                else:
+                    vecs = mistral_embed(pieces)
+                    pts = [PointStruct(id=point_id(it["id"], j), vector=v,
+                                       payload={"item_id": it["id"], "name": it["name"],
+                                                "web_url": it.get("webUrl", ""), "text": ch})
+                           for j, (ch, v) in enumerate(zip(pieces, vecs))]
+                    qdrant().upsert(COLLECTION, points=pts)
+                    indexed += 1; chunks_total += len(pts)
+                    log(f"indexed: {it['name']} ({len(pts)} chunks)")
         except Exception as e:
+            failed += 1
             log(f"FAILED {it['name']}: {e}")
-    log(f"Done. Scanned {scanned}, indexed {indexed} docs, {chunks_total} chunks.")
+        progress(n, total, indexed, skipped, notext, failed, chunks_total)
+    log(f"Done. {indexed} indexed · {skipped} already present · "
+        f"{notext} no-text · {failed} failed · {chunks_total} new chunks.")
 
 # ─────────────────────────────────────────────────────────── RAG
 def answer(question):
@@ -284,10 +320,10 @@ def answer(question):
     ctx, refs, seen = [], [], set()
     for i, h in enumerate(hits):
         p = h.payload
-        ctx.append(f"[{i+1}] (from: {p['name']})\n{p['text']}")
-        key = (p["name"], p.get("web_url", ""))
+        ctx.append(f"[{i+1}] (from: {p.get('name', '?')})\n{p.get('text', '')}")
+        key = (p.get("name"), p.get("web_url", ""))
         if key not in seen:
-            seen.add(key); refs.append({"name": p["name"], "web_url": p.get("web_url", "")})
+            seen.add(key); refs.append({"name": p.get("name", "?"), "web_url": p.get("web_url", "")})
     system = ("You are an HSE (Health, Safety & Environment) assistant. Answer ONLY from the "
               "context. Cite the source filename for each fact. If the answer isn't in the "
               "context, say so — never invent information.")
@@ -300,8 +336,7 @@ st.title("🦺 HSE Assistant")
 missing = [k for k, v in {"MISTRAL_API_KEY": MISTRAL_KEY, "QDRANT_URL": QDRANT_URL,
                           "QDRANT_API_KEY": QDRANT_KEY}.items() if not v]
 if missing:
-    st.error("Missing configuration: " + ", ".join(missing) +
-             ". Set them in the app's Secrets (see README).")
+    st.error("Missing configuration: " + ", ".join(missing) + ". Set them in the app's Secrets.")
     st.stop()
 
 tab_chat, tab_admin = st.tabs(["💬 Ask", "⚙️ Admin"])
@@ -366,22 +401,36 @@ with tab_admin:
     st.subheader("Sync")
     st.write(f"**Site:** {SITE_URL or '(SITE_URL not set)'}")
     st.write(f"**Index:** {index_count()} chunks")
+    force = st.checkbox("Force re-index (re-chunk even already-indexed files)")
     if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET and SITE_URL):
         st.warning("Set TENANT_ID, CLIENT_ID, CLIENT_SECRET and SITE_URL in Secrets to enable Sync.")
     else:
         if st.button("🔄 Sync SharePoint library → index"):
-            area = st.empty(); buf = []
-            def log(m): buf.append(str(m)); area.code("\n".join(buf[-300:]))
-            with st.spinner("Crawling and indexing… (this can take a while)"):
-                try:
-                    sync_library(log)
-                except Exception as e:
-                    log(f"ERROR: {e}")
+            bar = st.progress(0.0)
+            status = st.empty()
+            logbox = st.empty()
+            buf = []
+            def log(m):
+                buf.append(str(m)); logbox.code("\n".join(buf[-25:]))
+            def progress(done, total, indexed, skipped, notext, failed, chunks):
+                bar.progress(done / total if total else 1.0)
+                status.markdown(
+                    f"**{done}/{total}** files · {indexed} indexed · {skipped} already · "
+                    f"{notext} no-text · {failed} failed · {chunks} new chunks")
+            try:
+                sync_library(progress, log, force=force)
+                st.success("Sync finished.")
+            except Exception as e:
+                log(f"ERROR: {e}")
 
     st.divider()
-    if st.button("🗑️ Clear entire index"):
+    st.subheader("Danger zone")
+    st.caption("Clear removes ALL vectors so the next Sync re-chunks every document from scratch.")
+    confirm = st.checkbox("I understand — wipe the whole index")
+    if st.button("🗑️ Clear entire index", disabled=not confirm):
         try:
-            qdrant().delete_collection(COLLECTION); ensure_collection()
-            st.success("Index cleared.")
+            qdrant().delete_collection(COLLECTION)
+            ensure_collection()
+            st.success("Index cleared. Run Sync to rebuild.")
         except Exception as e:
             st.error(str(e))
