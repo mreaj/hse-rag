@@ -1,12 +1,14 @@
 """
 Offline bulk ingestion for the HSE Assistant.
-Run this ON YOUR MACHINE (not Streamlit Cloud) to load all SharePoint docs into the
-SAME cloud Qdrant the app reads. Resumable: safe to stop and re-run.
+Run this ON YOUR MACHINE (or via GitHub Actions) — NOT inside Streamlit Cloud (1 GB limit).
+It loads all SharePoint docs into the SAME cloud Qdrant the app reads.
 
   pip install requests qdrant-client pdfplumber python-docx tqdm
   # set the env vars below (or edit the CONFIG block), then:
   python ingest.py
 
+Resumable: it skips docs already in Qdrant AND remembers progress in processed.json,
+so stopping/re-running continues where it left off (never restarts from doc 1).
 Uses mistral-embed (1024-dim) so vectors match the app's query embeddings.
 """
 import os, io, re, json, time, uuid
@@ -20,7 +22,7 @@ from tqdm import tqdm
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
-# ─────────────────────────────── CONFIG (env vars, or edit the defaults) ───────
+# ─────────────────────────────── CONFIG (env vars, or edit defaults) ───────────
 MISTRAL_KEY   = os.getenv("MISTRAL_API_KEY",  "<your-mistral-key>")
 QDRANT_URL    = os.getenv("QDRANT_URL",        "https://XXXX.sa-east-1-0.aws.cloud.qdrant.io:6333")
 QDRANT_KEY    = os.getenv("QDRANT_API_KEY",    "<your-qdrant-key>")
@@ -36,22 +38,48 @@ CHUNK_OVERLAP = 200
 EMBED_BATCH   = 16
 SUPPORTED     = {".pdf", ".docx", ".txt", ".md"}
 GRAPH         = "https://graph.microsoft.com/v1.0"
-STATE_FILE    = "processed.json"       # remembers finished item_ids for resume
+STATE_FILE    = "processed.json"
 
-# ─────────────────────────────── Qdrant ────────────────────────────────────────
 qc = QdrantClient(url=QDRANT_URL, api_key=QDRANT_KEY, timeout=120, check_compatibility=False)
 
+# ─────────────────────────────── Qdrant ────────────────────────────────────────
 def ensure_collection():
     names = [c.name for c in qc.get_collections().collections]
     if COLLECTION not in names:
         qc.create_collection(COLLECTION,
                              vectors_config=VectorParams(size=1024, distance=Distance.COSINE))
         print(f'Created collection "{COLLECTION}"')
+    try:
+        qc.create_payload_index(collection_name=COLLECTION,
+                                field_name="item_id", field_schema="keyword")
+    except Exception:
+        pass
+
+def indexed_item_ids():
+    """Distinct item_ids already present in Qdrant (so we skip them even across machines)."""
+    ids = set()
+    try:
+        offset = None
+        while True:
+            points, offset = qc.scroll(collection_name=COLLECTION, limit=1000,
+                                       with_payload=["item_id"], with_vectors=False, offset=offset)
+            for p in points:
+                iid = (p.payload or {}).get("item_id")
+                if iid:
+                    ids.add(iid)
+            if offset is None:
+                break
+    except Exception:
+        pass
+    return ids
 
 # ─────────────────────────────── resume state ──────────────────────────────────
 def load_state():
     if os.path.exists(STATE_FILE):
-        return set(json.load(open(STATE_FILE)))
+        try:
+            return set(json.load(open(STATE_FILE)))
+        except Exception:
+            return set()
     return set()
 
 def save_state(done):
@@ -67,8 +95,7 @@ def embed(texts):
                               headers={"Authorization": f"Bearer {MISTRAL_KEY}"},
                               json={"model": EMBED_MODEL, "input": batch}, timeout=120)
             if r.status_code == 429 or r.status_code >= 500:
-                wait = float(r.headers.get("Retry-After", 2 ** attempt))
-                time.sleep(min(wait, 60)); continue
+                time.sleep(min(float(r.headers.get("Retry-After", 2 ** attempt)), 60)); continue
             r.raise_for_status()
             out.extend(d["embedding"] for d in r.json()["data"]); break
         else:
@@ -185,7 +212,6 @@ def point_id(item_id, ordinal):
 # ─────────────────────────────── main ──────────────────────────────────────────
 def main():
     ensure_collection()
-    done = load_state()
     token = graph_token()
 
     host, site, folder_path = parse_site_url(SITE_URL)
@@ -205,6 +231,9 @@ def main():
     print("Listing files…")
     files = [it for it in iter_files(site_id, drive_id, token, start)
              if Path(it["name"]).suffix.lower() in SUPPORTED]
+
+    # resume set = local processed.json  ∪  what's already in Qdrant
+    done = load_state() | indexed_item_ids()
     todo = [it for it in files if it["id"] not in done]
     print(f"{len(files)} files total · {len(done)} already done · {len(todo)} to do")
 
@@ -224,7 +253,7 @@ def main():
                 qc.upsert(COLLECTION, points=pts)
                 indexed += 1; chunks_total += len(pts)
             done.add(it["id"])
-            if len(done) % 25 == 0:            # checkpoint often so resume is precise
+            if len(done) % 25 == 0:
                 save_state(done)
         except Exception as e:
             failed += 1
