@@ -3,9 +3,10 @@ HSE Assistant — shared team app (rich UI + branding + memory-safe batch sync)
 ────────────────────────────────────────────────────────────────────────────
 Public docs → one shared index → give the URL to your team, they just ask.
 
-Bulk loading 1900+ docs: prefer running ingest.py (locally or via GitHub Actions).
-The in-app Sync here is MEMORY-SAFE: it indexes a small slice per click and stops,
-so it never exhausts Streamlit Cloud's ~1 GB container. Chunking is incremental.
+Bulk loading 1900+ docs: prefer ingest.py (locally or GitHub Actions).
+In-app Sync is memory-safe: it indexes a small slice per click and stops.
+Resume is reliable: it fetches the set of already-indexed doc IDs once and
+skips them, so clicking again advances to NEW docs (never restarts from doc 1).
 """
 import os, io, re, json, time, uuid, base64
 from pathlib import Path
@@ -85,6 +86,12 @@ def ensure_collection():
     if COLLECTION not in names:
         qdrant().create_collection(COLLECTION,
                                    vectors_config=VectorParams(size=1024, distance=Distance.COSINE))
+    # payload index on item_id makes filtering/skip fast (idempotent)
+    try:
+        qdrant().create_payload_index(collection_name=COLLECTION,
+                                      field_name="item_id", field_schema="keyword")
+    except Exception:
+        pass
 
 def index_count():
     try:
@@ -92,13 +99,25 @@ def index_count():
     except Exception:
         return 0
 
-def already_indexed(item_id):
+def indexed_item_ids():
+    """Return the SET of SharePoint item_ids already present in the index.
+    Fetched in one pass (paged) so batch-sync can skip them reliably & fast."""
+    ids = set()
     try:
-        c = qdrant().count(COLLECTION, exact=False, count_filter=Filter(
-            must=[FieldCondition(key="item_id", match=MatchValue(value=item_id))])).count
-        return c > 0
+        offset = None
+        while True:
+            points, offset = qdrant().scroll(
+                collection_name=COLLECTION, limit=1000,
+                with_payload=["item_id"], with_vectors=False, offset=offset)
+            for p in points:
+                iid = (p.payload or {}).get("item_id")
+                if iid:
+                    ids.add(iid)
+            if offset is None:
+                break
     except Exception:
-        return False
+        pass
+    return ids
 
 # ── branding stored in Qdrant so it persists + shows to everyone ──
 def _ensure_config_coll():
@@ -314,8 +333,7 @@ def index_one(drive_id, it, token, log):
     return len(pts)
 
 def sync_batch(limit, progress, log, force=False):
-    """Index up to `limit` not-yet-indexed files, then STOP (keeps memory low).
-    Returns how many files still remain, so you know whether to click again."""
+    """Index up to `limit` NOT-yet-indexed files, then STOP. Returns files still remaining."""
     ensure_collection()
     token = graph_app_token()
     site_id, drive_id, start_folder = _resolve_target(token, log)
@@ -323,17 +341,15 @@ def sync_batch(limit, progress, log, force=False):
     log("Listing files…")
     files = [it for it in iter_files(site_id, drive_id, token, start_folder)
              if Path(it["name"]).suffix.lower() in SUPPORTED]
-    total = len(files)
-    log(f"{total} supported files found.")
+    log(f"{len(files)} supported files found. Checking what's already indexed…")
 
-    indexed = skipped = notext = failed = chunks_total = remaining = 0
-    for it in files:
-        if not force and already_indexed(it["id"]):
-            skipped += 1
-            continue
-        if indexed >= limit:              # this batch is full — count the rest and stop
-            remaining += 1
-            continue
+    done_ids = set() if force else indexed_item_ids()
+    todo = [it for it in files if it["id"] not in done_ids]
+    log(f"{len(done_ids)} docs already indexed · {len(todo)} still to do.")
+
+    this_batch = todo[:limit]
+    indexed = notext = failed = chunks_total = 0
+    for k, it in enumerate(this_batch, 1):
         try:
             c = index_one(drive_id, it, token, log)
             if c:
@@ -342,9 +358,11 @@ def sync_batch(limit, progress, log, force=False):
                 notext += 1
         except Exception as e:
             failed += 1; log(f"FAILED {it['name']}: {e}")
-        progress(indexed, limit, skipped, notext, failed, chunks_total)
-    log(f"Batch done. {indexed} indexed · {skipped} already · {notext} no-text · "
-        f"{failed} failed · {chunks_total} chunks. ~{remaining} files remaining.")
+        progress(k, len(this_batch), indexed, notext, failed, chunks_total)
+
+    remaining = max(len(todo) - len(this_batch), 0)
+    log(f"Batch done. {indexed} indexed · {notext} no-text · {failed} failed · "
+        f"{chunks_total} chunks. ~{remaining} files remaining.")
     return remaining
 
 # ─────────────────────────────────────────────────────────── RAG
@@ -520,7 +538,7 @@ with tab_admin:
     # Sync (memory-safe, slice per click)
     st.markdown("#### 🔄 Sync documents (memory-safe)")
     st.caption("For the full 1900-doc load, run **ingest.py** (locally or via GitHub Actions). "
-               "In-app Sync indexes a small slice per click so it never runs out of memory.")
+               "In-app Sync indexes a slice per click and resumes (never restarts from doc 1).")
     st.write(f"**Site:** {SITE_URL or '(SITE_URL not set)'}")
     st.write(f"**Index:** {index_count():,} chunks")
     batch_n = st.number_input("Files to index per click", 20, 300, 100, step=20)
@@ -532,9 +550,9 @@ with tab_admin:
             bar = st.progress(0.0); status = st.empty(); logbox = st.empty(); buf = []
             def log(m):
                 buf.append(str(m)); logbox.code("\n".join(buf[-25:]))
-            def progress(indexed, limit, skipped, notext, failed, chunks):
-                bar.progress(min(indexed / limit, 1.0) if limit else 1.0)
-                status.markdown(f"**{indexed}/{limit}** indexed this batch · {skipped} already · "
+            def progress(done, total, indexed, notext, failed, chunks):
+                bar.progress(done / total if total else 1.0)
+                status.markdown(f"**{done}/{total}** this batch · {indexed} indexed · "
                                 f"{notext} no-text · {failed} failed · {chunks} chunks")
             try:
                 remaining = sync_batch(int(batch_n), progress, log, force=force)
