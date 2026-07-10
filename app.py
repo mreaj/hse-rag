@@ -70,9 +70,9 @@ DEFAULT_BRAND = {
 
 SUGGESTED = [
     "What PPE is required for confined space entry?",
-    "Summarise the permit-to-work procedure.",
-    "What are the steps in incident reporting?",
-    "What does the standard say about working at height?",
+    "Give me steps to avoid Electrocution.",
+    "Give me some HSENs based on high voltage",
+    "What major risks in working at height?",
 ]
 
 # ─────────────────────────────────────────────────────────── Qdrant
@@ -502,7 +502,7 @@ with tab_admin:
     with c2:
         up = st.file_uploader("Upload company logo (PNG/JPG/SVG, keep it small)",
                               type=["png", "jpg", "jpeg", "svg"])
-        title = st.text_input("App / company name", value=brand.get("title", "HSE Assistant"))
+        title = st.text_input("App / company name", value=brand.get("title", "HSEN Assistant"))
         subtitle = st.text_input("Subtitle", value=brand.get("subtitle", ""))
         accent = st.color_picker("Accent colour", value=brand.get("accent", "#0F9D8C"))
     b1, b2 = st.columns(2)
